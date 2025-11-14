@@ -13,7 +13,7 @@ Code will be released soon.
 
 All the compared dehazing network models are compressed in Compare.zip.
 
-Datasets and Pretrained Models
+Datasets and Sample Pretrained Models
 
 #RNH3K-NH
 
