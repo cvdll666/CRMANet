@@ -1,5 +1,7 @@
-
 # CRMANet
+
+![Framework](Framework.png)
+
 
 Test
 
