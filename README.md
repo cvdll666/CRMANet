@@ -1,8 +1,5 @@
 # CRMANet
 
-![Framework](Framework.png)
-
-
 Test
 
 Extract the downloaded dataset into the data folder, then run python test.py to perform testing.
