@@ -5,12 +5,12 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
-from network.net import MultiModalFusionUNet
+from net import MultiModalFusionUNet
 
 # Enable cuDNN auto-tuner for potential speedups on fixed-size inputs
 torch.backends.cudnn.benchmark = True
 
-strtmp = 'CRMANet16'
+strtmp = 'CRMANet16_val'
 
 class Config:
     # Device selection and general hyperparameters
@@ -22,7 +22,7 @@ class Config:
     epochs = 100
     img_size = 256
 
-    # Dataset directories
+    # Dataset directories (same as your original)
     train_hazy = "data/RNH-he/train/hazy"
     train_clean = "data/RNH-he/train/vis"
     train_nir = "data/RNH-he/train/nir"
@@ -33,10 +33,9 @@ class Config:
     test_clean = "data/RNH-he/test/vis"
     test_nir = "data/RNH-he/test/nir"
 
-    # Output and model paths
+    # Output and model path - NO trained_models or log folder dependency
     save_dir = "results"
-    ablation_log = "log/ablation.txt"
-    model_base_dir = "trained_models"
+    # Expect model file directly at this filename in current working dir (or specify full path)
     model_filename = strtmp + ".pth"
 
     # Model channel base
@@ -55,20 +54,21 @@ class DehazeDataset(Dataset):
         self.nir_dir = nir_dir
 
         # List image files from the hazy directory
-        self.hazy_filenames = [f for f in os.listdir(hazy_dir) if f.endswith(('.png', '.tiff'))]
+        # accept common extensions
+        self.hazy_filenames = sorted([f for f in os.listdir(hazy_dir) if f.lower().endswith(('.png', '.tiff', '.tif', '.jpg', '.jpeg'))])
 
         # Transform for RGB images (hazy and clean)
         self.transform_rgb = transforms.Compose([
             transforms.Resize((Config.img_size, Config.img_size)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # maps [0,1] -> [-1,1]
         ])
 
         # Transform for single-channel NIR images
         self.transform_nir = transforms.Compose([
             transforms.Resize((Config.img_size, Config.img_size)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5], std=[0.5])
+            transforms.Normalize(mean=[0.5], std=[0.5])  # maps [0,1] -> [-1,1]
         ])
 
     def __len__(self):
@@ -105,15 +105,13 @@ class DehazeDataset(Dataset):
 
 def test(cfg, model):
     """
-    Run inference on the test set using a saved model (best validation model expected).
-    Computes PSNR and SSIM for all test images and logs overall metrics.
+    Run inference on the test set using a saved model (expects model file at cfg.model_filename).
+    Computes PSNR and SSIM for all test images and prints overall metrics.
     """
-    # Determine model path for the saved best validation model (suffix "_val.pth")
-    val_name = cfg.model_filename
-    model_path_to_load = os.path.join(cfg.model_base_dir, val_name.replace(".pth", "_val.pth"))
+    model_path_to_load = cfg.model_filename  # directly use filename (no trained_models folder)
 
     if not os.path.exists(model_path_to_load):
-        print(f"Error: Model not found at {model_path_to_load}. Please train the model first.")
+        print(f"Error: Model file not found at '{model_path_to_load}'. Please place the trained model file there.")
         return
 
     # Load model weights and set model to eval mode
@@ -122,21 +120,28 @@ def test(cfg, model):
 
     # Prepare dataloader for testing
     test_set = DehazeDataset(cfg.test_hazy, cfg.test_clean, cfg.test_nir, is_train=False)
-    test_loader = DataLoader(test_set, batch_size=10, shuffle=False, num_workers=5)
+    test_loader = DataLoader(test_set, batch_size=cfg.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
     os.makedirs(cfg.save_dir, exist_ok=True)
 
     total_psnr = 0.0
     total_ssim = 0.0
 
-    # Inference loop with mixed precision
+    use_cuda_amp = (cfg.device.startswith("cuda") and torch.cuda.is_available())
+
+    # Inference loop
     with torch.no_grad():
         for batch_idx, (hazy, clean, nir) in enumerate(test_loader):
-            hazy = hazy.to(cfg.device)
-            clean = clean.to(cfg.device)
-            nir = nir.to(cfg.device)
+            hazy = hazy.to(cfg.device, non_blocking=True)
+            clean = clean.to(cfg.device, non_blocking=True)
+            nir = nir.to(cfg.device, non_blocking=True)
 
-            with torch.amp.autocast(cfg.device):
+            if use_cuda_amp:
+                # mixed precision on CUDA
+                from torch.cuda.amp import autocast
+                with autocast():
+                    output = model(hazy, nir)
+            else:
                 output = model(hazy, nir)
 
             # Convert normalized outputs from [-1, 1] to [0, 255] uint8 images
@@ -146,22 +151,26 @@ def test(cfg, model):
             output_np = output.cpu().numpy().transpose(0, 2, 3, 1).astype(np.uint8)
             clean_np = clean.cpu().numpy().transpose(0, 2, 3, 1).astype(np.uint8)
 
-            for i in range(output.size(0)):
+            for i in range(output_np.shape[0]):
                 pred = output_np[i]
                 gt = clean_np[i]
 
                 current_psnr = psnr(gt, pred, data_range=255)
-                current_ssim = ssim(gt, pred, data_range=255, channel_axis=2, multichannel=True)
-                total_psnr += current_psnr
-                total_ssim += current_ssim
+                # use channel_axis for skimage's ssim
+                current_ssim = ssim(gt, pred, data_range=255, channel_axis=2)
+                total_psnr += float(current_psnr)
+                total_ssim += float(current_ssim)
 
-    # Compute and log overall metrics
-    overall_avg_psnr = total_psnr / len(test_set)
-    overall_avg_ssim = total_ssim / len(test_set)
+    # Compute and print overall metrics (divide by number of images)
+    num_images = len(test_set)
+    if num_images == 0:
+        print("No test images found. Please check the test dataset path.")
+        return
+
+    overall_avg_psnr = total_psnr / num_images
+    overall_avg_ssim = total_ssim / num_images
     log_info = f"{strtmp} Overall PSNR: {overall_avg_psnr:.2f} dB Overall SSIM: {overall_avg_ssim:.4f}"
     print(log_info)
-    with open(cfg.ablation_log, "a") as f:
-        f.write(log_info + "\n")
 
 if __name__ == "__main__":
     cfg = Config()
