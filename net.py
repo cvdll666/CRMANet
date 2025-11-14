@@ -450,33 +450,100 @@ class MultiModalFusionUNet(nn.Module):
         return out
 
 
-def calculate_flops_params():
-    """Utility to run a forward pass and estimate FLOPs and parameter count using thop."""
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+def calculate_flops_params(model=None,
+                           use_nir=None,
+                           batch_size=1,
+                           img_h=256,
+                           img_w=256,
+                           nir_channels=1,
+                           device_override=None,
+                           runs=100,
+                           warmup=10):
+    """
+    Flexible FLOPs / params / timing utility that supports:
+      - single-modality: model(rgb)
+      - dual-modality: model(rgb, nir)
+
+    Args:
+      use_nir: True/False/None. If None -> try dual-modality first; on failure fall back.
+      batch_size, img_h, img_w: input shape
+      nir_channels: channels for NIR (usually 1)
+      device_override: 'cpu' or 'cuda' or None (auto-detect)
+      runs, warmup: timing configuration
+    """
+    device = device_override or ('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    model = MultiModalFusionUNet(dim=16, dim_mults=(1, 2, 4, 8),
-                           num_blocks_encoder=[2, 2, 2, 2],
-                           num_blocks_decoder=[2, 2, 2, 2]).to(device)
-
-    rgb_input = torch.randn(1, 3, 256, 256).to(device)
-    nir_input = torch.randn(1, 1, 256, 256).to(device)
+    # create inputs
+    rgb_input = torch.randn(batch_size, 3, img_h, img_w).to(device)
+    nir_input = torch.randn(batch_size, nir_channels, img_h, img_w).to(device)
 
     model.eval()
-    with torch.no_grad():
-        start = time.time()
-        result = model(rgb_input, nir_input)
-        end = time.time()
-        print(f"Forward pass time: {(end - start) * 1000:.2f} ms")
-        print("Output shape:", tuple(result.shape))
 
-    # run thop profiling on CPU for stability
+    # Decide whether to use NIR: explicit or probe by trying a forward pass
+    actual_use_nir = use_nir
+    if use_nir is None:
+        # try dual-modality first; if it errors, fall back to single
+        with torch.no_grad():
+            try:
+                _ = model(rgb_input, nir_input)
+                actual_use_nir = True
+            except TypeError:
+                # common if model signature expects only one arg
+                actual_use_nir = False
+            except RuntimeError:
+                # model may raise runtime errors for wrong shapes — fall back
+                actual_use_nir = False
+
+    print(f"Running inference with {'RGB+NIR' if actual_use_nir else 'RGB only'} inputs.")
+
+    # Warm-up runs (stabilize CUDA kernels / caches)
+    with torch.no_grad():
+        for i in range(warmup):
+            if actual_use_nir:
+                _ = model(rgb_input, nir_input)
+            else:
+                _ = model(rgb_input)
+            if device == 'cuda':
+                torch.cuda.synchronize()
+
+    # Timed runs
+    total_time = 0.0
+    result = None
+    with torch.no_grad():
+        for i in range(runs):
+            if device == 'cuda':
+                torch.cuda.synchronize()
+            start = time.time()
+            if actual_use_nir:
+                result = model(rgb_input, nir_input)
+            else:
+                result = model(rgb_input)
+            if device == 'cuda':
+                torch.cuda.synchronize()
+            end = time.time()
+            total_time += (end - start)
+
+    avg_time_ms = (total_time / runs) * 1000.0
+    print(f"Average inference time over {runs} runs: {avg_time_ms:.2f} ms")
+
+    # print output shape/type
+    if isinstance(result, torch.Tensor):
+        print("Output shape:", tuple(result.shape))
+    else:
+        print("Output type:", type(result))
+
+    # run thop profiling on CPU for stability (move model and inputs to CPU)
     model.to('cpu')
     rgb_input = rgb_input.to('cpu')
     nir_input = nir_input.to('cpu')
 
     try:
-        flops, params = profile(model, inputs=(rgb_input, nir_input), verbose=False)
+        if actual_use_nir:
+            flops, params = profile(model, inputs=(rgb_input, nir_input), verbose=False)
+        else:
+            flops, params = profile(model, inputs=(rgb_input,), verbose=False)
+
         gflops = flops / 1e9
         params_m = params / 1e6
         print(f"FLOPs: {gflops:.2f} G")
@@ -486,5 +553,12 @@ def calculate_flops_params():
         print("Ensure thop is installed (`pip install thop`) and inputs/model are on CPU for profile.")
 
 
+
 if __name__ == "__main__":
-    calculate_flops_params()
+    model = MultiModalFusionUNet(
+        dim=16,
+        dim_mults=(1, 2, 4, 8),
+        num_blocks_encoder=[2, 2, 2, 2],
+        num_blocks_decoder=[2, 2, 2, 2]
+    ).to('cuda')
+    calculate_flops_params(model, use_nir=None)
