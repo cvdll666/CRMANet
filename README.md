@@ -1,3 +1,4 @@
+
 # CRMANet
 
 Test
@@ -8,6 +9,7 @@ Train
 
 Code will be released soon.
 
+All the compared dehazing network models are compressed in Compare.zip.
 
 Datasets and Pretrained Models
 
